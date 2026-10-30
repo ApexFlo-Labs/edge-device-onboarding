@@ -200,3 +200,5 @@ bash tests/test-finish.sh ./onboard-device.sh
 ```
 
 The guided finish script accepts the engine's `--user`, `--intel-env`, and `--axelera-env` overrides for existing installations. Log in as the intended non-root administrator for the normal two-script flow; direct root sessions must supply `--user`.
+
+Successful verification ends with a short terminal table: PASS/SKIPPED, loaded Intel kernel drivers, installed graphics/NPU/firmware package versions, OpenVINO, Metis DKMS, Axelera runtime and flashed firmware/controller versions, and OpenSSH. It reads versions from the installation and the verified device query. The table is captured in the normal verification/finish log; no separate report workflow is required. Run its non-installing output test with `bash tests/test-summary.sh ./onboard-device.sh`.

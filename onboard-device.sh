@@ -18,6 +18,7 @@ INTEL_ENV=/opt/device-onboard/intel
 AXELERA_ENV=/opt/device-onboard/axelera
 MODE=install
 TARGET_USER=${SUDO_USER:-}
+FINISH_SCRIPT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/finish-setup.sh"
 WITH_RECOVERY=0
 LEGACY=0
 POWER_READY=0
@@ -25,6 +26,7 @@ REBOOT=0
 HAS_GPU=0
 GPU_BDF=
 HAS_NPU=0
+NPU_BDF=
 AXELERA_BDFS=()
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -88,13 +90,13 @@ parse_args() {
 }
 
 detect_hardware() {
-    HAS_GPU=0; HAS_NPU=0; GPU_BDF=; AXELERA_BDFS=()
+    HAS_GPU=0; HAS_NPU=0; GPU_BDF=; NPU_BDF=; AXELERA_BDFS=()
     local device vendor class
     for device in /sys/bus/pci/devices/*; do
         [[ -r $device/vendor && -r $device/class ]] || continue
         vendor=$(<"$device/vendor"); class=$(<"$device/class")
         if [[ $vendor == 0x8086 && $class == 0x03* ]]; then HAS_GPU=1; GPU_BDF=${device##*/}; fi
-        if [[ $vendor == 0x8086 && $class == 0x120000 ]]; then HAS_NPU=1; fi
+        if [[ $vendor == 0x8086 && $class == 0x120000 ]]; then HAS_NPU=1; NPU_BDF=${device##*/}; fi
         if [[ $vendor == 0x1f9d ]]; then AXELERA_BDFS+=("${device##*/}"); fi
     done
 }
@@ -236,8 +238,62 @@ PY
     fi
 }
 
+summary_row() { printf '%-25s %-8s %s\n' "$1" "$2" "$3"; }
+
+summary_package() {
+    local installed
+    installed=$(dpkg-query -W -f '${db:Status-Status}\t${Version}' "$2" 2>/dev/null) || die "Cannot read installed version of $2"
+    [[ $installed == installed$'\t'* ]] || die "$2 is not installed"
+    summary_row "$1" PASS "${installed#*$'\t'}"
+}
+
+summary_runtime() {
+    local version
+    version=$(runuser -u "$TARGET_USER" -- "$2/bin/python" -c \
+        'from importlib.metadata import version; import sys; print(version(sys.argv[1]))' "$3") || die "Cannot read installed version of $3"
+    summary_row "$1" PASS "$version"
+}
+
+summary_kernel_driver() {
+    local driver
+    driver=$(readlink "/sys/bus/pci/devices/$2/driver") || die "No loaded driver for $2"
+    summary_row "$1" PASS "${driver##*/} (kernel $(uname -r))"
+}
+
+print_summary() {
+    local line flashed controller
+    printf '\nFINAL SETUP REPORT\n'
+    summary_row Component Result 'Installed version / firmware'
+    summary_row Kernel PASS "$(uname -r)"
+    summary_package 'Platform firmware package' linux-firmware
+    if (( HAS_GPU )); then
+        summary_kernel_driver 'Intel GPU driver' "$GPU_BDF"
+        summary_package 'Intel GPU Level Zero' libze-intel-gpu1
+        summary_package 'Intel GPU OpenCL' intel-opencl-icd
+        summary_package 'Intel GPU media' intel-media-va-driver-non-free
+    else summary_row 'Intel GPU' SKIPPED 'Not detected'; fi
+    if (( HAS_NPU )); then
+        summary_kernel_driver 'Intel NPU driver' "$NPU_BDF"
+        summary_package 'Intel NPU Level Zero' intel-level-zero-npu
+        summary_package 'Intel NPU compiler' intel-driver-compiler-npu
+        summary_package 'Intel NPU firmware pkg' intel-fw-npu
+    else summary_row 'Intel NPU' SKIPPED 'Not detected'; fi
+    if (( HAS_GPU || HAS_NPU )); then summary_runtime OpenVINO "$INTEL_ENV" openvino; fi
+    if ((${#AXELERA_BDFS[@]})); then
+        summary_package 'Axelera driver' metis-dkms
+        summary_runtime 'Axelera runtime' "$AXELERA_ENV" axelera-rt
+        while IFS= read -r line; do
+            [[ $line == Device\ * ]] || continue
+            flashed=$(sed -n 's/.*flver=\([0-9][0-9.]*\).*/\1/p' <<< "$line")
+            controller=$(sed -n 's/.*bcver=\([0-9][0-9.]*\).*/\1/p' <<< "$line")
+            summary_row "Axelera ${line%%:*}" PASS "Firmware $flashed; controller $controller"
+        done <<< "$1"
+    else summary_row Axelera SKIPPED 'Not detected; nothing installed or flashed'; fi
+    summary_package 'OpenSSH server' openssh-server
+}
+
 verify_device() {
-    local firmware_pending=0
+    local firmware_pending=0 axelera_status=
     if [[ -f $STATE/native-boot-id && $(<"$STATE/native-boot-id") == "$(</proc/sys/kernel/random/boot_id)" ]]; then
         note 'Reboot first, then rerun verify to test startup without recovery'; return 20
     fi
@@ -256,6 +312,7 @@ verify_device() {
         [[ -x $AXELERA_ENV/bin/axdevice ]] || die 'Axelera runtime environment is missing'
         local status flashed controller action model_directory reported validation_output
         status=$(runuser -u "$TARGET_USER" -- env PATH="$AXELERA_ENV/bin:/usr/sbin:/usr/bin:/sbin:/bin" "$AXELERA_ENV/bin/axdevice" -v)
+        axelera_status=$status
         printf '%s\n' "$status"
         reported=$(grep -c '^Device [0-9][0-9]*:' <<< "$status" || true)
         (( reported == ${#AXELERA_BDFS[@]} )) || die 'Axelera runtime did not enumerate every expected PCI device'
@@ -290,10 +347,14 @@ verify_device() {
     fi
     if [[ -e /var/run/reboot-required ]]; then note 'Reboot required before signoff'; return 20; fi
     if (( firmware_pending )); then note 'Hardware checks ran; firmware baseline review/update is required before signoff'; return 20; fi
+    print_summary "$axelera_status"
     rm -f "$STATE/native-boot-id"
     note 'LOCAL VERIFICATION PASSED'
-    printf 'Now test SSH from another device: ssh %s@<device-ip>\n' "$TARGET_USER"
-    printf 'Local IP addresses: '; hostname -I
+    local -a local_addresses
+    read -r -a local_addresses <<< "$(hostname -I)"
+    if ((${#local_addresses[@]})); then
+        printf 'From another computer on the same network, test: ssh %s@%s\n' "$TARGET_USER" "${local_addresses[0]}"
+    fi
 }
 
 firmware_action() {
@@ -330,7 +391,8 @@ operator_confirm() {
 request_power_cycle() {
     note 'Firmware stage complete — a full power cycle is required'
     printf '%s\n' 'Once the PC is fully off, unplug its power for at least 10 seconds.' \
-        'Reconnect power, boot, and run: bash finish-setup.sh'
+        'Reconnect power and boot. Then paste this command:'
+    printf 'bash %q\n' "$FINISH_SCRIPT"
     operator_confirm 'Press Enter to shut down now: ' ''
     sync
     systemctl poweroff
@@ -373,7 +435,8 @@ finish_setup() {
         rm "$STATE/firmware-power-cycle-boot-id"
     fi
     if [[ -e $STATE/install-boot-id && $(<"$STATE/install-boot-id") == "$boot_id" ]]; then
-        operator_confirm 'Installation needs a reboot. Press Enter to reboot, then rerun finish-setup.sh: ' ''
+        printf 'After reboot, paste: bash %q\n' "$FINISH_SCRIPT"
+        operator_confirm 'Installation needs a reboot. Press Enter to reboot: ' ''
         systemctl reboot
         return 20
     fi
@@ -389,13 +452,14 @@ finish_setup() {
             POWER_READY=1
             if [[ $action == legacy ]]; then LEGACY=1; else LEGACY=0; fi
             firmware_update
-            note 'Rerun bash finish-setup.sh to continue'
+            printf 'To continue, paste: bash %q\n' "$FINISH_SCRIPT"
             return 20
         fi
         if [[ ! -e $STATE/finish-complete ]]; then
             if [[ ! -e $STATE/native-boot-id ]]; then prepare_native_boot; fi
             if [[ $(<"$STATE/native-boot-id") == "$boot_id" ]]; then
-                operator_confirm 'Firmware is current. Press Enter for the final startup reboot, then rerun finish-setup.sh: ' ''
+                printf 'After reboot, paste: bash %q\n' "$FINISH_SCRIPT"
+                operator_confirm 'Firmware is current. Press Enter for the final startup reboot: ' ''
                 systemctl reboot
                 return 20
             fi
@@ -525,7 +589,7 @@ main() {
             cat /proc/sys/kernel/random/boot_id > "$STATE/install-boot-id"
             rm -f "$STATE/finish-complete" "$STATE/native-boot-id"
             note 'INSTALLATION FINISHED — REBOOT AND VERIFY BEFORE SIGNOFF'
-            printf 'After reboot, run: bash finish-setup.sh\n'
+            printf 'After reboot, paste: bash %q\n' "$FINISH_SCRIPT"
             if (( REBOOT )); then systemctl reboot; else return 20; fi ;;
         verify) verify_device ;;
         finish) finish_setup ;;
