@@ -18,6 +18,8 @@ The script detects hardware through PCI sysfs. **If no Axelera card is detected,
 Run these commands on the device, as the existing administrator:
 
 ```bash
+sudo apt-get update
+sudo apt-get install -y git
 git clone https://github.com/ApexFlo-Labs/edge-device-onboarding.git
 cd edge-device-onboarding
 bash onboard-device.sh plan
@@ -174,5 +176,13 @@ bash onboard-device.sh plan
 ```
 
 Tests cover argument rejection, artifact verification, corrupted-download rejection, firmware routing and downgrade gates, absent optional Axelera hardware, missing expected cards, and verification before reboot. Hardware validation uses Intel numerical inference and a vendor-compiled Axelera model with output verification. A complete fresh-device installation still needs a pilot on the intended image before broad deployment.
+
+### Hardware validation on 30 October 2026
+
+On an Intel Core Ultra 9 285H device with a non-secure Metis 110m card, the unmodified vendor procedures completed the legacy enablement, intermediate controller, current firmware, and current controller stages. The card moved from firmware 1.3.2 / controller 1.4 through 1.4.0 / 7.0 to **1.9.0 / 7.5**, with four full power cycles.
+
+The published script's `verify` mode passed after the final cold boot and a subsequent normal reboot, using the device's existing runtime environments. Both boots enumerated the card with recovery disabled and without a manual PCIe rescan or `axdevice --refresh`. Intel GPU/NPU numerical inference, GPU OpenCL/media access, the active-kernel DKMS check, and external SSH login passed. The Axelera smoke tests validated all 1,457 frames after the cold boot and all 1,461 frames after the normal reboot. A further 30-second run validated all 14,976 frames. The obsolete custom recovery unit was then removed, with its backup retained outside the active systemd directory.
+
+These results validate this device and the documented vendor sequence. The new install mode and integrated firmware wrapper still need a complete fresh-device pilot; the firmware stages on this device were invoked directly with the same vendor tools and environment used by the wrapper.
 
 Vendor firmware and binary packages are downloaded from their official sources and are not redistributed in this repository.

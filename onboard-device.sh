@@ -282,7 +282,10 @@ verify_device() {
         rm -rf -- "$model_directory"
         (( result == 0 )) || die 'Axelera inference failed'
         grep -Eq 'validation: ok validated all [1-9][0-9]* checked frames' <<< "$validation_output" || die 'Axelera did not confirm output validation'
-        dkms status
+        local dkms_status
+        dkms_status=$(dkms status -m metis -v "$METIS_VERSION" -k "$(uname -r)")
+        printf '%s\n' "$dkms_status"
+        grep -Fq "metis/$METIS_VERSION, $(uname -r), $(uname -m): installed" <<< "$dkms_status" || die 'Metis DKMS is not installed for the running kernel'
     fi
     if [[ -e /var/run/reboot-required ]]; then note 'Reboot required before signoff'; return 20; fi
     if (( firmware_pending )); then note 'Hardware checks ran; firmware baseline review/update is required before signoff'; return 20; fi
