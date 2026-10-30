@@ -1,0 +1,6 @@
+*.log
+*.deb
+*.img
+*.bin
+__pycache__/
+.DS_Store
