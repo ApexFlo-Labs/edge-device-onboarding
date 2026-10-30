@@ -9,7 +9,8 @@ parse() { (source "$SCRIPT"; parse_args "$@"); }
 
 parse install --user edgeadmin
 parse verify --user edgeadmin --intel-env /opt/device-onboard/intel
-for arguments in 'install --user' 'install --hostname unexpected' 'verify --reboot' 'verify --with-axelera-recovery' 'verify --legacy' 'bad-mode'; do
+parse finish --user edgeadmin
+for arguments in 'install --user' 'install --hostname unexpected' 'verify --reboot' 'verify --with-axelera-recovery' 'verify --legacy' 'finish --legacy' 'finish --reboot' 'finish --power-cycle-ready' 'bad-mode'; do
     # Intentional word splitting for these fixed test vectors.
     # shellcheck disable=SC2086
     if parse $arguments >/dev/null 2>&1; then fail "Invalid arguments accepted: $arguments"; fi

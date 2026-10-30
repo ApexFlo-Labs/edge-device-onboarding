@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Ubuntu 24.04 amd64 / Intel Core Ultra onboarding baseline, 2026-10-30.
-# Vendor references and operating instructions are in README.md.
+# Operator instructions are in README.md; vendor details are in docs/maintenance.md.
 set -Eeuo pipefail
 
 NPU_VERSION=1.38.0
@@ -34,6 +34,7 @@ usage() {
 Usage:
   sudo bash onboard-device.sh install --user edgeadmin [options]
   sudo bash onboard-device.sh verify --user edgeadmin [options]
+  sudo bash onboard-device.sh finish --user edgeadmin [options]
   sudo bash onboard-device.sh firmware --user edgeadmin --power-cycle-ready
   sudo bash onboard-device.sh native-boot --user edgeadmin [--reboot]
   bash onboard-device.sh plan
@@ -57,7 +58,7 @@ HELP
 
 parse_args() {
     if (($#)) && [[ $1 != --* ]]; then MODE=$1; shift; fi
-    case $MODE in install|verify|firmware|native-boot|plan) ;; *) die "Unknown mode: $MODE" ;; esac
+    case $MODE in install|verify|finish|firmware|native-boot|plan) ;; *) die "Unknown mode: $MODE" ;; esac
     while (($#)); do
         case $1 in
             --user|--intel-env|--axelera-env)
@@ -319,6 +320,92 @@ fetch_verified() {
     verify_archive "$destination" "$digest" || die "Artifact checksum mismatch: $destination"
 }
 
+operator_confirm() {
+    local reply
+    [[ -t 0 ]] || die 'Run finish-setup.sh interactively in a terminal'
+    read -r -p "$1" reply
+    [[ $reply == "$2" ]] || die 'Cancelled; no further action taken'
+}
+
+request_power_cycle() {
+    note 'Firmware stage complete — a full power cycle is required'
+    printf '%s\n' 'Once the PC is fully off, unplug its power for at least 10 seconds.' \
+        'Reconnect power, boot, and run: bash finish-setup.sh'
+    operator_confirm 'Press Enter to shut down now: ' ''
+    sync
+    systemctl poweroff
+    return 20
+}
+
+firmware_stage_complete() {
+    if [[ $MODE == finish ]]; then
+        cat /proc/sys/kernel/random/boot_id > "$STATE/firmware-power-cycle-boot-id"
+        rm -f "$STATE/native-boot-id" "$STATE/finish-complete"
+        request_power_cycle
+    else
+        note 'Vendor stage returned successfully. Follow its power-cycle instruction, then rerun firmware'
+    fi
+    return 20
+}
+
+axelera_versions() {
+    [[ -x $AXELERA_ENV/bin/axdevice ]] || die 'Install the Axelera runtime first'
+    local status
+    status=$(env PATH="$AXELERA_ENV/bin:/usr/sbin:/usr/bin:/sbin:/bin" "$AXELERA_ENV/bin/axdevice")
+    printf '%s\n' "$status"
+    FLASHED_VERSION=$(sed -n 's/.*flver=\([0-9][0-9.]*\).*/\1/p' <<< "$status")
+    BOARD_CONTROLLER=$(sed -n 's/.*bcver=\([0-9][0-9.]*\).*/\1/p' <<< "$status")
+}
+
+prepare_native_boot() {
+    ((${#AXELERA_BDFS[@]})) || die 'Axelera must be present before preparing a native startup test'
+    if systemctl cat "$RECOVERY" >/dev/null 2>&1; then systemctl disable "$RECOVERY"; fi
+    printf '%s\n' "${#AXELERA_BDFS[@]}" > "$STATE/expected-axelera"
+    cat /proc/sys/kernel/random/boot_id > "$STATE/native-boot-id"
+}
+
+finish_setup() {
+    local boot_id action
+    boot_id=$(</proc/sys/kernel/random/boot_id)
+    if [[ -e $STATE/firmware-power-cycle-boot-id ]]; then
+        if [[ $(<"$STATE/firmware-power-cycle-boot-id") == "$boot_id" ]]; then request_power_cycle; fi
+        operator_confirm 'Did you disconnect power for at least 10 seconds after the last flash? Type YES: ' YES
+        rm "$STATE/firmware-power-cycle-boot-id"
+    fi
+    if [[ -e $STATE/install-boot-id && $(<"$STATE/install-boot-id") == "$boot_id" ]]; then
+        operator_confirm 'Installation needs a reboot. Press Enter to reboot, then rerun finish-setup.sh: ' ''
+        systemctl reboot
+        return 20
+    fi
+    if ((${#AXELERA_BDFS[@]})); then
+        ((${#AXELERA_BDFS[@]} == 1)) || die 'Automatic firmware setup supports one Axelera card; see docs/maintenance.md'
+        axelera_versions
+        action=$(firmware_action "$FLASHED_VERSION" "$BOARD_CONTROLLER")
+        [[ $action != newer ]] || die 'Firmware is newer than this baseline; automatic downgrades are not supported'
+        if [[ $action != current ]]; then
+            printf '%s\n' 'The next Axelera firmware stage is ready. Stop inference jobs and keep power connected during flashing.' \
+                'Someone must be here to unplug power after the updater finishes. Answer any vendor prompts carefully.'
+            operator_confirm 'Type UPDATE to start this stage: ' UPDATE
+            POWER_READY=1
+            if [[ $action == legacy ]]; then LEGACY=1; else LEGACY=0; fi
+            firmware_update
+            note 'Rerun bash finish-setup.sh to continue'
+            return 20
+        fi
+        if [[ ! -e $STATE/finish-complete ]]; then
+            if [[ ! -e $STATE/native-boot-id ]]; then prepare_native_boot; fi
+            if [[ $(<"$STATE/native-boot-id") == "$boot_id" ]]; then
+                operator_confirm 'Firmware is current. Press Enter for the final startup reboot, then rerun finish-setup.sh: ' ''
+                systemctl reboot
+                return 20
+            fi
+        fi
+    fi
+    verify_device
+    touch "$STATE/finish-complete"
+    note 'SETUP COMPLETE — local driver, inference, and SSH checks passed'
+}
+
 legacy_firmware_update() {
     local directory="$CACHE/legacy-1.4.0" runtime device status flashed controller action secure
     install -d -m 0700 "$directory"
@@ -360,8 +447,7 @@ legacy_firmware_update() {
             AXELERA_DEVICE_DIR="$device" AIPU_RUNTIME_STAGE0_OMEGA="$device/bin/start_axelera_runtime_stage0.bin" \
             bash "$device/firmware/interactive_flash_update.sh"
     fi
-    note 'Vendor stage returned successfully. Follow its power-cycle instruction, then rerun firmware --legacy'
-    return 20
+    firmware_stage_complete
 }
 
 firmware_update() {
@@ -372,16 +458,9 @@ firmware_update() {
     command -v lsof >/dev/null || die 'Install lsof before firmware work'
     lsof -t /dev/metis* >/dev/null 2>&1 && die 'Stop active Axelera workloads before flashing'
     if (( LEGACY )); then legacy_firmware_update; return; fi
-    [[ -x $AXELERA_ENV/bin/axdevice ]] || die 'Install the Axelera runtime first'
-    local status controller flashed
-    status=$(env PATH="$AXELERA_ENV/bin:/usr/sbin:/usr/bin:/sbin:/bin" "$AXELERA_ENV/bin/axdevice")
-    printf '%s\n' "$status"
-    controller=$(sed -n 's/.*bcver=\([0-9][0-9.]*\).*/\1/p' <<< "$status")
-    flashed=$(sed -n 's/.*flver=\([0-9][0-9.]*\).*/\1/p' <<< "$status")
-    [[ -n $controller ]] || die 'Cannot identify board controller version'
-    [[ -n $flashed ]] || die 'Cannot identify flashed firmware version'
+    axelera_versions
     local action
-    action=$(firmware_action "$flashed" "$controller")
+    action=$(firmware_action "$FLASHED_VERSION" "$BOARD_CONTROLLER")
     if [[ $action == legacy ]]; then
         note 'LEGACY FIRMWARE PREPARATION REQUIRED — NOTHING FLASHED'
         printf '%s\n' \
@@ -400,9 +479,7 @@ firmware_update() {
     if systemctl cat "$RECOVERY" >/dev/null 2>&1; then systemctl disable --now "$RECOVERY"; fi
     # Keep the official sequence and safety checks intact. No --force or piped yes.
     env PATH="$AXELERA_ENV/bin:/usr/sbin:/usr/bin:/sbin:/bin" "$AXELERA_ENV/bin/axdevice" interactive_flash_update
-    note 'Follow the vendor output: power-cycle when requested and rerun firmware until fully updated'
-    printf 'Do not use a warm reboot in place of the requested full power cycle.\n'
-    return 20
+    firmware_stage_complete
 }
 
 main() {
@@ -445,16 +522,16 @@ main() {
             note 'Optional Axelera driver and runtime'; install_axelera
             if (( HAS_NPU )); then update-initramfs -u -k all; fi
             dpkg-query -W > "$STATE/package-versions.txt"
+            cat /proc/sys/kernel/random/boot_id > "$STATE/install-boot-id"
+            rm -f "$STATE/finish-complete" "$STATE/native-boot-id"
             note 'INSTALLATION FINISHED — REBOOT AND VERIFY BEFORE SIGNOFF'
-            printf 'sudo bash %q verify --user %q --intel-env %q --axelera-env %q\n' "$0" "$TARGET_USER" "$INTEL_ENV" "$AXELERA_ENV"
+            printf 'After reboot, run: bash finish-setup.sh\n'
             if (( REBOOT )); then systemctl reboot; else return 20; fi ;;
         verify) verify_device ;;
+        finish) finish_setup ;;
         firmware) firmware_update ;;
         native-boot)
-            ((${#AXELERA_BDFS[@]})) || die 'Axelera must be present before preparing a native startup test'
-            if systemctl cat "$RECOVERY" >/dev/null 2>&1; then systemctl disable "$RECOVERY"; fi
-            printf '%s\n' "${#AXELERA_BDFS[@]}" > "$STATE/expected-axelera"
-            cat /proc/sys/kernel/random/boot_id > "$STATE/native-boot-id"
+            prepare_native_boot
             note 'Recovery disabled. Reboot, then run verify to test native startup'
             if (( REBOOT )); then systemctl reboot; else return 20; fi ;;
     esac
