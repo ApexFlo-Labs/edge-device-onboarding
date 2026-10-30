@@ -23,7 +23,7 @@ bash "$HOME/edge-device-setup/finish-setup.sh"
 Follow the instructions on screen:
 
 - If asked to update Axelera, type `UPDATE`. Keep power connected while it flashes.
-- Only after the update finishes successfully, press Enter to shut down. Wait until the PC is fully off, unplug power for **10 seconds**, reconnect it, and turn it on.
+- Only after the update finishes successfully, the script explains the power cycle, shows a **30-second countdown**, and shuts down automatically. Wait until the PC is fully off, unplug power for **10 seconds**, reconnect it, and turn it on.
 - After **every** restart or power cycle, paste the same command from step 2 again. Older Axelera cards may need four power cycles, followed by a normal restart.
 
 **You are done when it prints `SETUP COMPLETE`.** The final terminal report shows PASS/SKIPPED, installed driver/runtime versions, and Axelera firmware/controller versions. Without Axelera, its installation and firmware steps are skipped automatically.
@@ -31,5 +31,7 @@ Follow the instructions on screen:
 Copy the SSH command printed at the end into another computer's terminal to test access. Network/VPN enrollment is separate.
 
 If a step fails, stop and read the error. Do not remove power during a flash. Logs are in `/var/log/device-onboard/`. [Technical reference](docs/maintenance.md).
+
+If Axelera disappears after the initial reboot, the same finish script requests a full power cycle and gives the same **30-second countdown** before shutdown. No firmware is flashed while the card is missing. After reconnecting power and booting, paste step 2 again. If the card remains missing, the script stops for a hardware/BIOS check instead of repeatedly shutting down.
 
 The guided flow has simulated safety tests. Pilot a complete fresh-device setup before fleet rollout.

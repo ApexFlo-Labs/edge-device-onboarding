@@ -189,7 +189,7 @@ Vendor firmware and binary packages are downloaded from their official sources a
 
 ## Guided setup state
 
-`setup.sh` runs installation and requests a reboot. `finish-setup.sh` automatically selects the existing legacy/current vendor sequence, requires operator confirmation before each flash, and offers shutdown only after successful stage completion. A saved boot ID prevents a second stage in the same boot; after a new boot the operator must confirm actual power removal. A warm reboot alone cannot prove this.
+`setup.sh` runs installation and requests a reboot. `finish-setup.sh` automatically selects the existing legacy/current vendor sequence, requires operator confirmation before each flash, and starts the 30-second shutdown countdown after successful stage completion. A previously detected card missing after reboot also triggers one initial cold-cycle request before any flash. A saved boot ID prevents a second stage in the same boot; after a new boot the operator must confirm actual power removal. A warm reboot alone cannot prove this.
 
 The final Axelera startup test disables the managed recovery unit and requires another boot before verification. Completion is recorded only after verification succeeds. Re-running the finish script after completion reruns checks without repeating installation or the startup reboot. Run these additional non-installing checks from the repository root:
 
@@ -202,3 +202,7 @@ bash tests/test-finish.sh ./onboard-device.sh
 The guided finish script accepts the engine's `--user`, `--intel-env`, and `--axelera-env` overrides for existing installations. Log in as the intended non-root administrator for the normal two-script flow; direct root sessions must supply `--user`.
 
 Successful verification ends with a short terminal table: PASS/SKIPPED, loaded Intel kernel drivers, installed graphics/NPU/firmware package versions, OpenVINO, Metis DKMS, Axelera runtime and flashed firmware/controller versions, and OpenSSH. It reads versions from the installation and the verified device query. The table is captured in the normal verification/finish log; no separate report workflow is required. Run its non-installing output test with `bash tests/test-summary.sh ./onboard-device.sh`.
+
+Fast failures drain the logging process before exit, so sudo cannot close its terminal before the error is displayed. Errors include the exit code and log location; exit 20 remains a manual-action state. Existing Axelera source/key files are repaired to mode 0644 and their public APT directories to 0755. Installation uses umask 022 for public configuration; private state/cache/log directories remain 0700. Test these paths without touching system configuration using `python3 tests/test-errors.py ./onboard-device.sh`.
+
+The guided finish flow prints power-removal instructions and counts down for 30 seconds before calling `systemctl poweroff`; Ctrl+C cancels the countdown. It also offers this cold cycle when a previously detected card disappears after installation's warm reboot. A saved boot ID limits this recovery to one subsequent boot; a card still missing afterward stops for inspection. The missing-card guard never skips the card or flashes an absent device. Direct advanced `firmware` mode retains its manual power-cycle procedure.

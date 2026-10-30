@@ -17,6 +17,7 @@ if [[ ${1:-} == --case ]]; then
     }
     systemctl() { printf 'systemctl %s\n' "$*" >> "$STATE/events"; [[ $1 != cat ]]; }
     sync() { :; }
+    sleep() { :; }
     axelera_versions() { printf 'query\n' >> "$STATE/events"; }
     verify_device() {
         printf 'verify\n' >> "$STATE/events"
@@ -115,7 +116,7 @@ printf '#!/usr/bin/env bash\nexec "$@"\n' > "$TEST_DIR/bin/sudo"
 chmod +x "$TEST_DIR/bin/sudo"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@"\n' > "$TEST_DIR/wrappers/onboard-device.sh"
 PATH="$TEST_DIR/bin:$PATH" bash "$TEST_DIR/wrappers/setup.sh" --user edgeadmin > "$TEST_DIR/setup-args"
-printf '%s\n' install --reboot --user edgeadmin | diff - "$TEST_DIR/setup-args"
+printf '%s\n' 'Installing device software...' install --reboot --user edgeadmin | diff - "$TEST_DIR/setup-args"
 PATH="$TEST_DIR/bin:$PATH" bash "$TEST_DIR/wrappers/finish-setup.sh" --user edgeadmin > "$TEST_DIR/finish-args"
-printf '%s\n' finish --user edgeadmin | diff - "$TEST_DIR/finish-args"
+printf '%s\n' 'Finishing device setup...' finish --user edgeadmin | diff - "$TEST_DIR/finish-args"
 printf 'PASS: guided setup routing, power-cycle/reboot guards, failed-flash safety, completion, and wrapper dispatch\n'

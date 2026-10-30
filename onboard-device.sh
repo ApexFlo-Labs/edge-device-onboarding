@@ -31,6 +31,57 @@ AXELERA_BDFS=()
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 note() { printf '\n== %s ==\n' "$*"; }
+device_boot_id() { cat /proc/sys/kernel/random/boot_id; }
+
+make_apt_file_readable() {
+    [[ -f $1 ]] || return 0
+    chmod 0755 "$(dirname -- "$1")"
+    chmod 0644 "$1"
+}
+
+record_error() {
+    ONBOARD_FAILED_LINE=$1
+    ONBOARD_FAILED_COMMAND=$2
+}
+
+finish_logging() {
+    local status=$1
+    trap - EXIT ERR
+    # Close both pipe writers, then drain tee before sudo closes its terminal.
+    exec 1>&3 2>&4 3>&- 4>&-
+    wait "$ONBOARD_LOG_PID" || true
+    if (( status != 0 && status != 20 )); then
+        printf '\nFAILED (exit %s). Command: %s; line: %s\nLog: %s\n' \
+            "$status" "${ONBOARD_FAILED_COMMAND:-see error above}" "${ONBOARD_FAILED_LINE:-n/a}" "$ONBOARD_LOG" | \
+            tee -a "$ONBOARD_LOG" >&2 || true
+    fi
+    exit "$status"
+}
+
+start_logging() {
+    ONBOARD_LOG=$1
+    : >> "$ONBOARD_LOG" || die "Cannot write log: $ONBOARD_LOG"
+    printf 'Log: %s\n' "$ONBOARD_LOG"
+    exec 3>&1 4>&2
+    exec > >(tee -a "$ONBOARD_LOG") 2>&1
+    ONBOARD_LOG_PID=$!
+    trap 'record_error "$LINENO" "$BASH_COMMAND"' ERR
+    trap 'finish_logging "$?"' EXIT
+}
+
+require_expected_axelera() {
+    if [[ -r $STATE/expected-axelera ]] && ((${#AXELERA_BDFS[@]} < $(<"$STATE/expected-axelera"))); then
+        local boot_id
+        boot_id=$(device_boot_id)
+        if [[ $MODE == finish ]] && \
+            [[ ! -e $STATE/missing-axelera-boot-id || $(<"$STATE/missing-axelera-boot-id") == "$boot_id" ]]; then
+            printf '%s\n' "$boot_id" > "$STATE/missing-axelera-boot-id"
+            request_power_cycle 'Axelera is missing after reboot. No firmware was flashed in this run; a full power cycle is needed.'
+        fi
+        die 'Axelera is still missing after a restart. Confirm power was unplugged for 10 seconds; otherwise check the card/BIOS. No firmware was flashed in this run'
+    fi
+    rm -f "$STATE/missing-axelera-boot-id"
+}
 usage() {
     cat <<'HELP'
 Usage:
@@ -153,11 +204,12 @@ install_axelera() {
         die 'Secure Boot is enabled. Arrange DKMS signing-key enrollment before using this baseline'
     fi
     apt-get install -y build-essential dkms "linux-headers-$(uname -r)" lsof libgl1 libglib2.0-0t64
-    install -d -m 0755 /etc/apt/keyrings
+    install -d -m 0755 /etc/apt/keyrings /etc/apt/sources.list.d
     download https://software.axelera.ai/artifactory/api/security/keypair/axelera/public "$CACHE/axelera-signing.asc"
     gpg --batch --yes --dearmor -o /etc/apt/keyrings/axelera.gpg "$CACHE/axelera-signing.asc"
-    chmod 0644 /etc/apt/keyrings/axelera.gpg
+    make_apt_file_readable /etc/apt/keyrings/axelera.gpg
     printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/axelera.gpg] https://software.axelera.ai/artifactory/axelera-apt-source ubuntu24 main' > /etc/apt/sources.list.d/axelera.list
+    make_apt_file_readable /etc/apt/sources.list.d/axelera.list
     apt-get update
     apt-get install -y "metis-dkms=$METIS_VERSION"
     usermod -aG axelera "$TARGET_USER"
@@ -389,11 +441,16 @@ operator_confirm() {
 }
 
 request_power_cycle() {
-    note 'Firmware stage complete — a full power cycle is required'
+    note "${1:-Firmware stage complete — a full power cycle is required}"
     printf '%s\n' 'Once the PC is fully off, unplug its power for at least 10 seconds.' \
         'Reconnect power and boot. Then paste this command:'
     printf 'bash %q\n' "$FINISH_SCRIPT"
-    operator_confirm 'Press Enter to shut down now: ' ''
+    local remaining
+    for ((remaining=30; remaining>0; remaining--)); do
+        printf '\rShutting down in %2d seconds. Ctrl+C cancels.' "$remaining"
+        sleep 1
+    done
+    printf '\n'
     sync
     systemctl poweroff
     return 20
@@ -563,17 +620,21 @@ main() {
     install -d -m 0700 "$STATE" "$CACHE" /var/log/device-onboard
     exec 9>/run/device-onboard.lock
     flock -n 9 || die 'Another onboarding operation is running'
-    exec > >(tee -a "/var/log/device-onboard/$(date +%Y%m%d-%H%M%S)-$MODE.log") 2>&1
-    trap 'error_status=$?; if (( error_status != 20 )); then printf "ERROR: operation failed at line %s; review the log.\n" "$LINENO" >&2; fi' ERR
-    if [[ -r $STATE/expected-axelera ]] && ((${#AXELERA_BDFS[@]} < $(<"$STATE/expected-axelera"))); then
-        die 'A previously detected Axelera card is missing; resolve PCI enumeration before proceeding'
-    fi
+    start_logging "/var/log/device-onboard/$(date +%Y%m%d-%H%M%S)-$MODE.log"
+    # Repair existing files even if a previously fitted card is currently missing.
+    # On a cardless fresh device these calls create nothing.
+    make_apt_file_readable /etc/apt/sources.list.d/axelera.list
+    make_apt_file_readable /etc/apt/keyrings/axelera.gpg
+    require_expected_axelera
     if [[ $MODE == firmware ]] && ((${#AXELERA_BDFS[@]})) && [[ ! -e $STATE/expected-axelera ]]; then
         printf '%s\n' "${#AXELERA_BDFS[@]}" > "$STATE/expected-axelera"
     fi
     case $MODE in
         install)
             export DEBIAN_FRONTEND=noninteractive
+            # Public APT configuration needs normal permissions. Private state,
+            # cache, and logs remain protected by their 0700 parent directories.
+            umask 022
             note 'Base packages and remote access'
             apt-get update
             apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade -y
